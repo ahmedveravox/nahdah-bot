@@ -67,3 +67,10 @@ CREATE INDEX IF NOT EXISTS idx_clients_active ON clients(active);
 
 -- Full-text search على المنتجات
 CREATE INDEX IF NOT EXISTS idx_products_name_search ON products USING gin(to_tsvector('arabic', COALESCE(name_ar, '') || ' ' || COALESCE(name, '')));
+
+-- تعطيل RLS عشان يشتغل مع anon/publishable key
+ALTER TABLE clients DISABLE ROW LEVEL SECURITY;
+ALTER TABLE categories DISABLE ROW LEVEL SECURITY;
+ALTER TABLE products DISABLE ROW LEVEL SECURITY;
+ALTER TABLE conversations DISABLE ROW LEVEL SECURITY;
+ALTER TABLE orders DISABLE ROW LEVEL SECURITY;
