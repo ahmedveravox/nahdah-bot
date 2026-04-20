@@ -87,6 +87,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── /scrape ───────────────────────────────────────────────────────────────────
 
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أمر /test — يختبر Gemini ويرجع النتيجة"""
+    user = update.effective_user
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
+        await update.message.reply_text("ما عندك صلاحية.")
+        return
+    await update.message.reply_text("⏳ أختبر Gemini...")
+    ok, msg = ai_handler.test_gemini()
+    if ok:
+        await update.message.reply_text(f"✅ Gemini شغّال!\nالرد: {msg}")
+    else:
+        await update.message.reply_text(f"❌ Gemini فاشل!\nالخطأ: {msg}\n\nتحقق من GEMINI_API_KEY في Railway Variables.")
+
+
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if ADMIN_IDS and user.id not in ADMIN_IDS:
@@ -281,7 +295,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(app: Application) -> None:
     await load_products_cache()
-    logger.info("✅ Nahdah Asia Bot ready!")
+    # تحقق من Gemini عند التشغيل
+    ok, msg = ai_handler.test_gemini()
+    if ok:
+        logger.info(f"✅ Gemini OK: {msg}")
+    else:
+        logger.error(f"❌ Gemini FAILED: {msg}")
 
 
 def main() -> None:
@@ -295,6 +314,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("products", products_command))
     app.add_handler(CommandHandler("scrape",   scrape_command))
+    app.add_handler(CommandHandler("test",     test_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.VOICE,                   handle_voice))
