@@ -1,7 +1,9 @@
 """
-Gemini AI handler — يولّد ردود باللهجة السعودية
+Gemini AI handler — ردود باللهجة السعودية + دعم الصور والصوت
 """
 import os
+import io
+import base64
 import logging
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -10,130 +12,170 @@ import database as db
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+genai.configure(api_key=GEMINI_KEY)
 
-# نجرب أكثر من موديل — نبدأ بالأحدث
-MODELS_FALLBACK = [
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-pro",
+GENERATION_CONFIG = {
+    "temperature": 0.7,
+    "max_output_tokens": 350,
+}
+
+SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
 
-SYSTEM_PROMPT = """أنت مساعد بوت تلغرام لعطارة "نهضة أسيا" — متخصصين في الأعشاب والتوابل والمنتجات الطبيعية.
+SYSTEM_PROMPT = """أنت مساعد ذكي لعطارة "نهضة أسيا" للأعشاب والتوابل والمنتجات الطبيعية.
 
-قواعد ثابتة:
-- تكلم باللهجة السعودية الخليجية الودية دايماً
-- ردودك قصيرة ومباشرة (2-3 جمل بحد أقصى)
-- إذا العميل يسأل عن منتج، ابحث في المنتجات المتاحة واقترح الأنسب
-- لما تعرض منتجات، ذكر الاسم والسعر بشكل واضح
-- إذا ما في منتج محدد، اقترح البديل القريب
-- لا تتكلم في مواضيع خارج العطارة والمنتجات الطبيعية
-- للطلب أو الاستفسار، وجّه العميل للتواصل عبر الموقع nhdah.com
+قواعد صارمة:
+- اللهجة سعودية خليجية ودية دايماً
+- الرد قصير ومباشر: جملتين أو ثلاث بحد أقصى
+- اقترح المنتج المناسب من القائمة مع ذكر السعر
+- لو ما في منتج محدد، اقترح الأقرب إليه
+- الموقع للطلب: nhdah.com
 
 المنتجات المتاحة:
 {products_context}
 """
 
 
-def _build_products_context(products: list[dict]) -> str:
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_model(vision: bool = False) -> genai.GenerativeModel:
+    name = "gemini-1.5-flash" if vision else "gemini-1.5-flash"
+    return genai.GenerativeModel(
+        model_name=name,
+        generation_config=GENERATION_CONFIG,
+        safety_settings=SAFETY_SETTINGS,
+    )
+
+
+def _products_context(products: list[dict]) -> str:
     if not products:
         return "لا يوجد منتجات محمّلة حالياً."
     lines = []
     for p in products[:60]:
         cat = ""
-        if p.get("categories") and isinstance(p["categories"], dict):
+        if isinstance(p.get("categories"), dict):
             cat = f" [{p['categories'].get('name_ar', '')}]"
         price = f" - {p['price']} ريال" if p.get("price") else ""
-        name = p.get("name_ar") or p.get("name", "")
-        lines.append(f"• {name}{cat}{price}")
+        lines.append(f"• {p.get('name_ar') or p.get('name', '')}{cat}{price}")
     return "\n".join(lines)
 
 
-def _get_model():
-    """يحاول يجيب موديل شغّال"""
-    for model_name in MODELS_FALLBACK:
-        try:
-            m = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config={
-                    "temperature": 0.7,
-                    "max_output_tokens": 300,
-                },
-            )
-            return m
-        except Exception as exc:
-            logger.warning(f"Model {model_name} failed: {exc}")
-    return None
+def _history_text(history: list[dict]) -> str:
+    if not history:
+        return ""
+    lines = []
+    for msg in history[-6:]:
+        prefix = "عميل" if msg["role"] == "user" else "بوت"
+        lines.append(f"{prefix}: {msg['message']}")
+    return "\n".join(lines) + "\n"
 
 
-async def generate_reply(
-    user_id: int,
-    user_message: str,
-    products: list[dict],
-) -> str:
-    history = db.get_conversation_history(user_id, limit=8)
-    products_context = _build_products_context(products)
-    system = SYSTEM_PROMPT.format(products_context=products_context)
+def _build_prompt(user_message: str, products: list[dict], history: list[dict]) -> str:
+    system = SYSTEM_PROMPT.format(products_context=_products_context(products))
+    hist   = _history_text(history)
+    return f"{system}\n\n{hist}عميل: {user_message}\nبوت:"
 
-    # نبني prompt مع السياق الكامل بدون chat history
-    # (أبسط وأضمن مع الـ anon key)
-    history_text = ""
-    if history:
-        lines = []
-        for msg in history[-6:]:
-            prefix = "عميل" if msg["role"] == "user" else "بوت"
-            lines.append(f"{prefix}: {msg['message']}")
-        history_text = "\n".join(lines) + "\n"
 
-    prompt = (
-        f"{system}\n\n"
-        f"{'سياق المحادثة السابقة:' + chr(10) + history_text if history_text else ''}"
-        f"عميل: {user_message}\n"
-        f"بوت:"
-    )
-
+def _safe_text(response) -> str:
     try:
-        model = _get_model()
-        if not model:
-            raise ValueError("No available Gemini model")
+        text = response.text.strip()
+        return text if text else ""
+    except Exception:
+        return ""
 
+
+# ─── Public API ────────────────────────────────────────────────────────────────
+
+async def generate_reply(user_id: int, user_message: str, products: list[dict]) -> str:
+    """رد على رسالة نصية"""
+    history = db.get_conversation_history(user_id, limit=8)
+    prompt  = _build_prompt(user_message, products, history)
+    try:
+        model    = _get_model()
         response = model.generate_content(prompt)
-        text = response.text.strip() if response.text else ""
-        if not text:
-            raise ValueError("Empty response from Gemini")
-        return text
-
+        text     = _safe_text(response)
+        if text:
+            return text
+        raise ValueError("empty response")
     except Exception as exc:
-        logger.error(f"Gemini error: {exc}")
-        # رد احتياطي بدون AI
+        logger.error(f"Gemini text error: {exc}")
         return _fallback_reply(user_message, products)
 
 
+async def generate_reply_image(user_id: int, image_bytes: bytes, caption: str, products: list[dict]) -> str:
+    """يفهم الصورة ويرد — العميل يرسل صورة منتج"""
+    history = db.get_conversation_history(user_id, limit=4)
+    system  = SYSTEM_PROMPT.format(products_context=_products_context(products))
+    hist    = _history_text(history)
+
+    prompt_text = (
+        f"{system}\n\n{hist}"
+        f"العميل أرسل صورة"
+        f"{' مع تعليق: ' + caption if caption else '.'}\n"
+        f"حدّد المنتج في الصورة إذا كان من منتجاتنا، أو اقترح الأنسب. بوت:"
+    )
+
+    try:
+        # نحوّل الصورة لـ base64 ونرسلها لـ Gemini Vision
+        img_b64  = base64.b64encode(image_bytes).decode()
+        img_part = {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+        model    = _get_model(vision=True)
+        response = model.generate_content([prompt_text, img_part])
+        text     = _safe_text(response)
+        if text:
+            return text
+        raise ValueError("empty vision response")
+    except Exception as exc:
+        logger.error(f"Gemini image error: {exc}")
+        return "وصلت الصورة 📸 — ابعث لي اسم المنتج اللي تبيه وأساعدك أكثر! 🌿"
+
+
+async def generate_reply_voice(user_id: int, audio_bytes: bytes, products: list[dict]) -> str:
+    """يفهم الرسالة الصوتية ويرد"""
+    history = db.get_conversation_history(user_id, limit=4)
+    system  = SYSTEM_PROMPT.format(products_context=_products_context(products))
+    hist    = _history_text(history)
+
+    prompt_text = (
+        f"{system}\n\n{hist}"
+        f"العميل أرسل رسالة صوتية. اسمعها وحدّد طلبه وارد عليه باللهجة السعودية. بوت:"
+    )
+
+    try:
+        audio_b64  = base64.b64encode(audio_bytes).decode()
+        audio_part = {"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}}
+        model      = _get_model(vision=True)  # gemini-1.5-flash يدعم الصوت أيضاً
+        response   = model.generate_content([prompt_text, audio_part])
+        text       = _safe_text(response)
+        if text:
+            return text
+        raise ValueError("empty audio response")
+    except Exception as exc:
+        logger.error(f"Gemini voice error: {exc}")
+        return "سمعت رسالتك الصوتية 🎙️ — ممكن تكتب طلبك بالنص عشان أخدمك أحسن! 🌿"
+
+
+# ─── Fallback ──────────────────────────────────────────────────────────────────
+
 def _fallback_reply(message: str, products: list[dict]) -> str:
-    """رد بسيط بدون AI لو فشل Gemini"""
-    searched = [
-        p for p in products
-        if any(w in (p.get("name_ar") or p.get("name", "")).lower()
-               for w in message.lower().split())
-    ]
-    if searched:
-        p = searched[0]
-        name = p.get("name_ar") or p.get("name", "")
-        price = f" بسعر {p['price']} ريال" if p.get("price") else ""
-        return f"عندنا {name}{price} 🌿 تبي تطلب؟ تواصل معنا على nhdah.com"
-    return "هلا! كيف أقدر أساعدك؟ اكتب اسم المنتج اللي تبيه وأنا أدلّك 🌿"
+    words = message.lower().split()
+    for p in products:
+        name = (p.get("name_ar") or p.get("name", "")).lower()
+        if any(w in name for w in words):
+            price = f" بسعر {p['price']} ريال" if p.get("price") else ""
+            return f"عندنا {p.get('name_ar') or p.get('name', '')}{price} 🌿 تقدر تطلب من nhdah.com"
+    return "هلا! اكتب اسم المنتج اللي تبيه وأنا أدلّك 🌿"
 
 
-def extract_product_query(message: str) -> str | None:
-    """يستخرج اسم المنتج أو الفئة المطلوبة من رسالة العميل"""
+def extract_product_query(message: str) -> bool:
     keywords = [
-        "أبي", "ابي", "أريد", "اريد", "أطلب", "اطلب",
-        "عندكم", "يوجد", "بكم", "كم سعر", "كم ثمن",
-        "ما سعر", "هل عندكم", "دواء", "علاج",
-        "توابل", "أعشاب", "زعتر", "كمون", "هيل",
+        "أبي","ابي","أريد","اريد","بكم","كم سعر","كم ثمن",
+        "ما سعر","هل عندكم","عندكم","يوجد","دواء","علاج",
+        "توابل","أعشاب","زعتر","كمون","هيل","عسل","زيت",
     ]
-    msg_lower = message.lower()
-    for kw in keywords:
-        if kw in msg_lower:
-            return message
-    return None
+    return any(kw in message for kw in keywords)

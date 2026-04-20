@@ -4,7 +4,6 @@
 """
 import os
 import logging
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,8 +26,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN_IDS = set(
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+)
 
-# كاش المنتجات — نحمّلها مرة وحدة
 _products_cache: list[dict] = []
 
 
@@ -38,106 +39,110 @@ async def load_products_cache() -> None:
     logger.info(f"Loaded {len(_products_cache)} products into cache")
 
 
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _relevant_products(text: str) -> list[dict]:
+    if ai_handler.extract_product_query(text):
+        searched = db.search_products(text)
+        if searched:
+            ids = {p["id"] for p in searched}
+            rest = [p for p in _products_cache if p["id"] not in ids]
+            return searched + rest
+    return _products_cache
+
+
+async def _check_active(user_id: int) -> bool:
+    return db.is_client_active(user_id)
+
+
+async def _register(user) -> None:
+    db.upsert_client(user.id, user.username, user.full_name)
+
+
 # ─── /start ────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    db.upsert_client(user.id, user.username, user.full_name)
+    await _register(user)
 
     keyboard = [
         [
-            InlineKeyboardButton("🛍️ المنتجات", callback_data="show_products"),
-            InlineKeyboardButton("🔍 بحث", callback_data="search_hint"),
+            InlineKeyboardButton("🛍️ المنتجات",    callback_data="show_products"),
+            InlineKeyboardButton("🔍 بحث",         callback_data="search_hint"),
         ],
         [
-            InlineKeyboardButton("📞 تواصل معنا", callback_data="contact"),
-            InlineKeyboardButton("🌿 عن المتجر", callback_data="about"),
+            InlineKeyboardButton("📞 تواصل معنا",  callback_data="contact"),
+            InlineKeyboardButton("🌿 عن المتجر",   callback_data="about"),
         ],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    welcome = (
+    await update.message.reply_text(
         f"هلا وغلا يا {user.first_name}! 👋\n"
-        "أهلاً بك في عطارة **نهضة أسيا** 🌿\n"
+        "أهلاً بك في عطارة *نهضة أسيا* 🌿\n"
         "متجرك للأعشاب والتوابل والمنتجات الطبيعية الأصيلة.\n\n"
-        "كيف أقدر أخدمك اليوم؟"
+        "كيف أقدر أخدمك اليوم؟",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(welcome, reply_markup=reply_markup, parse_mode="Markdown")
 
 
-# ─── /scrape (admin) ───────────────────────────────────────────────────────────
-
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",") if os.getenv("ADMIN_IDS") else []))
-
+# ─── /scrape ───────────────────────────────────────────────────────────────────
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if ADMIN_IDS and user.id not in ADMIN_IDS:
-        await update.message.reply_text("ما عندك صلاحية لهذا الأمر.")
+        await update.message.reply_text("ما عندك صلاحية.")
         return
-
-    await update.message.reply_text("⏳ يا بيت.. أبدأ بسحب المنتجات من الموقع...")
+    await update.message.reply_text("⏳ أبدأ سحب المنتجات...")
     try:
-        result = run_full_scrape(enrich=False)
+        result = run_full_scrape()
         await load_products_cache()
         await update.message.reply_text(
-            f"✅ تم بنجاح!\n"
-            f"📂 الفئات: {result['categories']}\n"
-            f"📦 المنتجات: {result['products']}"
+            f"✅ تم!\n📂 الفئات: {result['categories']}\n📦 المنتجات: {result['products']}"
         )
     except Exception as exc:
-        logger.error(f"Scrape failed: {exc}")
-        await update.message.reply_text(f"❌ صار خطأ: {exc}")
+        logger.error(f"Scrape error: {exc}")
+        await update.message.reply_text(f"❌ خطأ: {exc}")
 
 
 # ─── /products ─────────────────────────────────────────────────────────────────
 
 async def products_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _products_cache:
-        await update.message.reply_text("ما في منتجات محمّلة حالياً. جرب بعد شوي. 🙏")
-        return
-
     categories = db.get_categories()
     if not categories:
-        await _show_flat_products(update, _products_cache[:15])
+        await _show_products_list(update.message.reply_text, _products_cache[:15])
         return
+    keyboard = _categories_keyboard(categories)
+    await update.message.reply_text(
+        "اختر الفئة:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    keyboard = []
-    row = []
+
+def _categories_keyboard(categories: list[dict]) -> list[list]:
+    keyboard, row = [], []
     for i, cat in enumerate(categories):
         row.append(InlineKeyboardButton(
             cat.get("name_ar") or cat.get("name"),
-            callback_data=f"cat_{cat['id']}"
+            callback_data=f"cat_{cat['id']}",
         ))
         if len(row) == 2 or i == len(categories) - 1:
             keyboard.append(row)
             row = []
-
     keyboard.append([InlineKeyboardButton("🛍️ كل المنتجات", callback_data="all_products")])
-    await update.message.reply_text(
-        "اختر الفئة اللي تبيها:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    return keyboard
 
 
-async def _show_flat_products(update_or_query, products: list[dict]) -> None:
+async def _show_products_list(reply_fn, products: list[dict]) -> None:
     if not products:
-        text = "ما لقينا منتجات في هذه الفئة."
-    else:
-        lines = []
-        for p in products[:15]:
-            price = f" — {p['price']} ريال" if p.get("price") else ""
-            lines.append(f"🌿 *{p.get('name_ar') or p.get('name')}*{price}")
-        text = "المنتجات المتاحة:\n\n" + "\n".join(lines)
-        if len(products) > 15:
-            text += f"\n\n_(وأكثر من ذلك... ابحث عن اللي تبيه)_"
-
-    if hasattr(update_or_query, "callback_query"):
-        await update_or_query.callback_query.edit_message_text(text, parse_mode="Markdown")
-    elif hasattr(update_or_query, "edit_message_text"):
-        await update_or_query.edit_message_text(text, parse_mode="Markdown")
-    else:
-        await update_or_query.message.reply_text(text, parse_mode="Markdown")
+        await reply_fn("ما لقينا منتجات.")
+        return
+    lines = []
+    for p in products[:15]:
+        price = f" — {p['price']} ريال" if p.get("price") else ""
+        lines.append(f"🌿 *{p.get('name_ar') or p.get('name')}*{price}")
+    text = "المنتجات المتاحة:\n\n" + "\n".join(lines)
+    if len(products) > 15:
+        text += "\n\n_اكتب اسم المنتج للبحث عن المزيد_"
+    await reply_fn(text, parse_mode="Markdown")
 
 
 # ─── Callback Buttons ──────────────────────────────────────────────────────────
@@ -145,107 +150,138 @@ async def _show_flat_products(update_or_query, products: list[dict]) -> None:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data  = query.data
 
     if data == "show_products":
-        categories = db.get_categories()
-        if categories:
-            keyboard = []
-            row = []
-            for i, cat in enumerate(categories):
-                row.append(InlineKeyboardButton(
-                    cat.get("name_ar") or cat.get("name"),
-                    callback_data=f"cat_{cat['id']}"
-                ))
-                if len(row) == 2 or i == len(categories) - 1:
-                    keyboard.append(row)
-                    row = []
-            keyboard.append([InlineKeyboardButton("🛍️ كل المنتجات", callback_data="all_products")])
-            await query.edit_message_text("اختر الفئة:", reply_markup=InlineKeyboardMarkup(keyboard))
+        cats = db.get_categories()
+        if cats:
+            await query.edit_message_text(
+                "اختر الفئة:", reply_markup=InlineKeyboardMarkup(_categories_keyboard(cats))
+            )
         else:
-            await _show_flat_products(query, _products_cache[:15])
+            await _show_products_list(query.edit_message_text, _products_cache[:15])
 
     elif data.startswith("cat_"):
-        cat_id = int(data.split("_")[1])
-        products = db.get_products_by_category(cat_id)
-        await _show_flat_products(query, products)
+        products = db.get_products_by_category(int(data.split("_")[1]))
+        await _show_products_list(query.edit_message_text, products)
 
     elif data == "all_products":
-        await _show_flat_products(query, _products_cache[:20])
+        await _show_products_list(query.edit_message_text, _products_cache[:20])
 
     elif data == "search_hint":
         await query.edit_message_text(
-            "🔍 فقط اكتب اسم المنتج أو اللي تبي وأنا أساعدك!\n"
-            "مثلاً: *هيل، زعتر، حبة البركة، عسل...*",
-            parse_mode="Markdown"
+            "🔍 اكتب اسم المنتج اللي تبيه:\n"
+            "_مثلاً: هيل، زعتر، حبة البركة، عسل..._",
+            parse_mode="Markdown",
         )
 
     elif data == "contact":
         await query.edit_message_text(
-            "📞 **تواصل معنا:**\n\n"
-            "🌐 الموقع: https://nhdah.com/ar\n"
-            "📧 راسلنا عبر الموقع الرسمي\n\n"
-            "نرد عليك بأسرع وقت! 🌿",
-            parse_mode="Markdown"
+            "📞 *تواصل معنا:*\n\n"
+            "🌐 nhdah.com/ar\n"
+            "نرد عليك بأسرع وقت 🌿",
+            parse_mode="Markdown",
         )
 
     elif data == "about":
         await query.edit_message_text(
-            "🌿 **نهضة أسيا للعطارة**\n\n"
-            "متخصصون في الأعشاب الطبيعية والتوابل الأصيلة والمنتجات الصحية.\n"
-            "جودة عالية وأسعار منافسة.\n\n"
-            "زورونا على: nhdah.com 🛍️",
-            parse_mode="Markdown"
+            "🌿 *نهضة أسيا للعطارة*\n\n"
+            "متخصصون في الأعشاب الطبيعية والتوابل الأصيلة.\n"
+            "جودة عالية وأسعار منافسة 🛍️\n\n"
+            "زورونا: nhdah.com",
+            parse_mode="Markdown",
         )
 
 
-# ─── Message Handler ───────────────────────────────────────────────────────────
+# ─── Text Handler ──────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     text = update.message.text.strip()
+    await _register(user)
 
-    # تسجيل العميل
-    db.upsert_client(user.id, user.username, user.full_name)
+    if not await _check_active(user.id):
+        return
 
-    # تحقق من الحساب النشط
-    if not db.is_client_active(user.id):
-        logger.info(f"Inactive client {user.id} tried to message")
-        return  # صامت — ما نرد
-
-    # حفظ رسالة المستخدم
     db.save_message(user.id, "user", text)
-
-    # مؤشر الكتابة
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    # البحث في المنتجات إذا كان في كلمات بحث
-    relevant_products = _products_cache
-    if ai_handler.extract_product_query(text):
-        searched = db.search_products(text)
-        if searched:
-            relevant_products = searched + [p for p in _products_cache if p not in searched]
-
-    # توليد الرد
-    reply = await ai_handler.generate_reply(user.id, text, relevant_products)
-
-    # حفظ رد البوت
+    reply = await ai_handler.generate_reply(user.id, text, _relevant_products(text))
     db.save_message(user.id, "assistant", reply)
+    await update.message.reply_text(reply)
 
+
+# ─── Photo Handler ─────────────────────────────────────────────────────────────
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user    = update.effective_user
+    await _register(user)
+
+    if not await _check_active(user.id):
+        return
+
+    caption = update.message.caption or ""
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    try:
+        # نجيب أعلى دقة للصورة
+        photo   = update.message.photo[-1]
+        file    = await context.bot.get_file(photo.file_id)
+        img_buf = await file.download_as_bytearray()
+        img_bytes = bytes(img_buf)
+
+        db.save_message(user.id, "user", f"[صورة] {caption}".strip())
+        reply = await ai_handler.generate_reply_image(
+            user.id, img_bytes, caption, _products_cache
+        )
+    except Exception as exc:
+        logger.error(f"Photo handler error: {exc}")
+        reply = "وصلت الصورة 📸 — ابعث لي اسم المنتج بالنص وأساعدك! 🌿"
+
+    db.save_message(user.id, "assistant", reply)
+    await update.message.reply_text(reply)
+
+
+# ─── Voice Handler ─────────────────────────────────────────────────────────────
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await _register(user)
+
+    if not await _check_active(user.id):
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    try:
+        voice     = update.message.voice
+        file      = await context.bot.get_file(voice.file_id)
+        audio_buf = await file.download_as_bytearray()
+        audio_bytes = bytes(audio_buf)
+
+        db.save_message(user.id, "user", "[رسالة صوتية]")
+        reply = await ai_handler.generate_reply_voice(
+            user.id, audio_bytes, _products_cache
+        )
+    except Exception as exc:
+        logger.error(f"Voice handler error: {exc}")
+        reply = "سمعت رسالتك 🎙️ — اكتب طلبك بالنص وأخدمك أحسن! 🌿"
+
+    db.save_message(user.id, "assistant", reply)
     await update.message.reply_text(reply)
 
 
 # ─── Error Handler ─────────────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception: {context.error}", exc_info=context.error)
+    logger.error(f"Update error: {context.error}", exc_info=context.error)
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
     await load_products_cache()
-    logger.info("Bot initialized. Products cache loaded.")
+    logger.info("✅ Nahdah Asia Bot ready!")
 
 
 def main() -> None:
@@ -256,10 +292,12 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("products", products_command))
-    app.add_handler(CommandHandler("scrape", scrape_command))
+    app.add_handler(CommandHandler("scrape",   scrape_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE,                   handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
