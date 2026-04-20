@@ -11,7 +11,13 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
+
+# نجرب أكثر من موديل — نبدأ بالأحدث
+MODELS_FALLBACK = [
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-pro",
+]
 
 SYSTEM_PROMPT = """أنت مساعد بوت تلغرام لعطارة "نهضة أسيا" — متخصصين في الأعشاب والتوابل والمنتجات الطبيعية.
 
@@ -22,9 +28,9 @@ SYSTEM_PROMPT = """أنت مساعد بوت تلغرام لعطارة "نهضة 
 - لما تعرض منتجات، ذكر الاسم والسعر بشكل واضح
 - إذا ما في منتج محدد، اقترح البديل القريب
 - لا تتكلم في مواضيع خارج العطارة والمنتجات الطبيعية
-- للطلب أو الاستفسار، وجّه العميل للتواصل المباشر
+- للطلب أو الاستفسار، وجّه العميل للتواصل عبر الموقع nhdah.com
 
-المنتجات المتاحة (من الموقع):
+المنتجات المتاحة:
 {products_context}
 """
 
@@ -33,24 +39,31 @@ def _build_products_context(products: list[dict]) -> str:
     if not products:
         return "لا يوجد منتجات محمّلة حالياً."
     lines = []
-    for p in products[:80]:  # نحدد بـ 80 منتج عشان ما تطول كثير
+    for p in products[:60]:
         cat = ""
-        if p.get("categories"):
+        if p.get("categories") and isinstance(p["categories"], dict):
             cat = f" [{p['categories'].get('name_ar', '')}]"
         price = f" - {p['price']} ريال" if p.get("price") else ""
-        lines.append(f"• {p.get('name_ar') or p.get('name', '')}{cat}{price}")
+        name = p.get("name_ar") or p.get("name", "")
+        lines.append(f"• {name}{cat}{price}")
     return "\n".join(lines)
 
 
-def _build_history(history: list[dict]) -> list[dict]:
-    gemini_history = []
-    for msg in history[:-1]:  # آخر رسالة راح نرسلها كـ user turn
-        role = "user" if msg["role"] == "user" else "model"
-        gemini_history.append({
-            "role": role,
-            "parts": [msg["message"]],
-        })
-    return gemini_history
+def _get_model():
+    """يحاول يجيب موديل شغّال"""
+    for model_name in MODELS_FALLBACK:
+        try:
+            m = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={
+                    "temperature": 0.7,
+                    "max_output_tokens": 300,
+                },
+            )
+            return m
+        except Exception as exc:
+            logger.warning(f"Model {model_name} failed: {exc}")
+    return None
 
 
 async def generate_reply(
@@ -58,34 +71,65 @@ async def generate_reply(
     user_message: str,
     products: list[dict],
 ) -> str:
-    history = db.get_conversation_history(user_id, limit=10)
+    history = db.get_conversation_history(user_id, limit=8)
     products_context = _build_products_context(products)
     system = SYSTEM_PROMPT.format(products_context=products_context)
 
+    # نبني prompt مع السياق الكامل بدون chat history
+    # (أبسط وأضمن مع الـ anon key)
+    history_text = ""
+    if history:
+        lines = []
+        for msg in history[-6:]:
+            prefix = "عميل" if msg["role"] == "user" else "بوت"
+            lines.append(f"{prefix}: {msg['message']}")
+        history_text = "\n".join(lines) + "\n"
+
+    prompt = (
+        f"{system}\n\n"
+        f"{'سياق المحادثة السابقة:' + chr(10) + history_text if history_text else ''}"
+        f"عميل: {user_message}\n"
+        f"بوت:"
+    )
+
     try:
-        # نبني المحادثة مع السياق
-        chat = model.start_chat(history=_build_history(history))
+        model = _get_model()
+        if not model:
+            raise ValueError("No available Gemini model")
 
-        # نضيف السيستم برومبت في أول رسالة لو ما في تاريخ
-        if not history:
-            full_message = f"{system}\n\n---\nرسالة العميل: {user_message}"
-        else:
-            full_message = user_message
-
-        response = chat.send_message(full_message)
-        return response.text.strip()
+        response = model.generate_content(prompt)
+        text = response.text.strip() if response.text else ""
+        if not text:
+            raise ValueError("Empty response from Gemini")
+        return text
 
     except Exception as exc:
         logger.error(f"Gemini error: {exc}")
-        return "عذراً، صار خلل بسيط. حاول مرة ثانية بعد شوي. 🙏"
+        # رد احتياطي بدون AI
+        return _fallback_reply(user_message, products)
+
+
+def _fallback_reply(message: str, products: list[dict]) -> str:
+    """رد بسيط بدون AI لو فشل Gemini"""
+    searched = [
+        p for p in products
+        if any(w in (p.get("name_ar") or p.get("name", "")).lower()
+               for w in message.lower().split())
+    ]
+    if searched:
+        p = searched[0]
+        name = p.get("name_ar") or p.get("name", "")
+        price = f" بسعر {p['price']} ريال" if p.get("price") else ""
+        return f"عندنا {name}{price} 🌿 تبي تطلب؟ تواصل معنا على nhdah.com"
+    return "هلا! كيف أقدر أساعدك؟ اكتب اسم المنتج اللي تبيه وأنا أدلّك 🌿"
 
 
 def extract_product_query(message: str) -> str | None:
     """يستخرج اسم المنتج أو الفئة المطلوبة من رسالة العميل"""
     keywords = [
         "أبي", "ابي", "أريد", "اريد", "أطلب", "اطلب",
-        "عندكم", "عندكم", "يوجد", "في", "بكم", "كم سعر",
-        "كم ثمن", "ما سعر", "هل عندكم", "دواء", "علاج",
+        "عندكم", "يوجد", "بكم", "كم سعر", "كم ثمن",
+        "ما سعر", "هل عندكم", "دواء", "علاج",
         "توابل", "أعشاب", "زعتر", "كمون", "هيل",
     ]
     msg_lower = message.lower()
