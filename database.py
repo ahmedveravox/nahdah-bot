@@ -1,138 +1,157 @@
 """
-Supabase database manager for Nahdah Asia bot
+Supabase database manager — direct REST API (works with anon/publishable key)
 """
 import os
 import logging
-from supabase import create_client, Client
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+REST_URL = f"{SUPABASE_URL}/rest/v1"
 
-def get_client() -> Client:
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
-    return create_client(url, key)
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+}
+
+
+def _get(table: str, params: dict = None) -> list[dict]:
+    try:
+        r = requests.get(f"{REST_URL}/{table}", headers=HEADERS, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json() if isinstance(r.json(), list) else []
+    except Exception as exc:
+        logger.error(f"GET {table} failed: {exc}")
+        return []
+
+
+def _post(table: str, data: dict | list, prefer: str = "return=representation") -> list[dict]:
+    try:
+        h = {**HEADERS, "Prefer": prefer}
+        r = requests.post(f"{REST_URL}/{table}", headers=h, json=data, timeout=10)
+        r.raise_for_status()
+        return r.json() if r.text else []
+    except Exception as exc:
+        logger.error(f"POST {table} failed: {exc}")
+        return []
+
+
+def _upsert(table: str, data: dict | list, on_conflict: str) -> list[dict]:
+    try:
+        h = {**HEADERS, "Prefer": f"resolution=merge-duplicates,return=representation"}
+        params = {"on_conflict": on_conflict}
+        r = requests.post(f"{REST_URL}/{table}", headers=h, json=data, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json() if r.text else []
+    except Exception as exc:
+        logger.error(f"UPSERT {table} failed: {exc}")
+        return []
 
 
 # ─── Clients ───────────────────────────────────────────────────────────────────
 
 def upsert_client(user_id: int, username: str | None, full_name: str) -> dict:
-    db = get_client()
     data = {
         "id": user_id,
         "username": username,
         "full_name": full_name,
-        "updated_at": "now()",
     }
-    result = db.table("clients").upsert(data, on_conflict="id").execute()
-    return result.data[0] if result.data else {}
+    result = _upsert("clients", data, on_conflict="id")
+    return result[0] if result else {}
 
 
 def is_client_active(user_id: int) -> bool:
-    db = get_client()
-    result = db.table("clients").select("active").eq("id", user_id).single().execute()
-    if not result.data:
+    rows = _get("clients", params={"id": f"eq.{user_id}", "select": "active"})
+    if not rows:
         return True  # عميل جديد — نشط افتراضياً
-    return result.data.get("active", True)
+    return rows[0].get("active", True)
 
 
 # ─── Conversations ──────────────────────────────────────────────────────────────
 
 def save_message(client_id: int, role: str, message: str) -> None:
-    db = get_client()
-    db.table("conversations").insert({
+    _post("conversations", {
         "client_id": client_id,
         "role": role,
         "message": message,
-    }).execute()
+    })
 
 
 def get_conversation_history(client_id: int, limit: int = 10) -> list[dict]:
-    db = get_client()
-    result = (
-        db.table("conversations")
-        .select("role, message, created_at")
-        .eq("client_id", client_id)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    messages = result.data or []
-    return list(reversed(messages))
+    rows = _get("conversations", params={
+        "client_id": f"eq.{client_id}",
+        "select": "role,message,created_at",
+        "order": "created_at.desc",
+        "limit": limit,
+    })
+    return list(reversed(rows))
 
 
 # ─── Products ──────────────────────────────────────────────────────────────────
 
 def get_all_products(limit: int = 200) -> list[dict]:
-    db = get_client()
-    result = (
-        db.table("products")
-        .select("*, categories(name, name_ar)")
-        .eq("in_stock", True)
-        .limit(limit)
-        .execute()
-    )
-    return result.data or []
+    return _get("products", params={
+        "in_stock": "eq.true",
+        "select": "*, categories(name, name_ar)",
+        "limit": limit,
+    })
 
 
 def search_products(query: str) -> list[dict]:
-    db = get_client()
-    result = (
-        db.table("products")
-        .select("*, categories(name, name_ar)")
-        .or_(f"name.ilike.%{query}%,name_ar.ilike.%{query}%,description.ilike.%{query}%")
-        .eq("in_stock", True)
-        .limit(10)
-        .execute()
-    )
-    return result.data or []
+    return _get("products", params={
+        "or": f"(name.ilike.*{query}*,name_ar.ilike.*{query}*,description.ilike.*{query}*)",
+        "in_stock": "eq.true",
+        "select": "*, categories(name, name_ar)",
+        "limit": 10,
+    })
 
 
 def get_products_by_category(category_id: int) -> list[dict]:
-    db = get_client()
-    result = (
-        db.table("products")
-        .select("*, categories(name, name_ar)")
-        .eq("category_id", category_id)
-        .eq("in_stock", True)
-        .limit(20)
-        .execute()
-    )
-    return result.data or []
+    return _get("products", params={
+        "category_id": f"eq.{category_id}",
+        "in_stock": "eq.true",
+        "select": "*, categories(name, name_ar)",
+        "limit": 20,
+    })
 
 
 def get_categories() -> list[dict]:
-    db = get_client()
-    result = db.table("categories").select("*").execute()
-    return result.data or []
+    return _get("categories")
 
 
 def upsert_products(products: list[dict]) -> int:
     if not products:
         return 0
-    db = get_client()
-    db.table("products").upsert(products, on_conflict="product_url").execute()
-    return len(products)
+    # نرفع على دفعات عشان ما يطول الطلب
+    batch_size = 50
+    total = 0
+    for i in range(0, len(products), batch_size):
+        batch = products[i:i + batch_size]
+        result = _upsert("products", batch, on_conflict="product_url")
+        total += len(result)
+    return total
 
 
 def upsert_categories(categories: list[dict]) -> int:
     if not categories:
         return 0
-    db = get_client()
-    db.table("categories").upsert(categories, on_conflict="slug").execute()
-    return len(categories)
+    result = _upsert("categories", categories, on_conflict="slug")
+    return len(result)
 
 
 # ─── Orders ────────────────────────────────────────────────────────────────────
 
 def save_order(client_id: int, product_name: str, notes: str = "") -> dict:
-    db = get_client()
-    result = db.table("orders").insert({
+    result = _post("orders", {
         "client_id": client_id,
         "product_name": product_name,
         "notes": notes,
         "status": "pending",
-    }).execute()
-    return result.data[0] if result.data else {}
+    })
+    return result[0] if result else {}
