@@ -93,12 +93,12 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if ADMIN_IDS and user.id not in ADMIN_IDS:
         await update.message.reply_text("ما عندك صلاحية.")
         return
-    await update.message.reply_text("⏳ أختبر Gemini...")
-    ok, msg = ai_handler.test_gemini()
+    await update.message.reply_text("⏳ أختبر Claude API...")
+    ok, msg = ai_handler.test_claude()
     if ok:
-        await update.message.reply_text(f"✅ Gemini شغّال!\nالرد: {msg}")
+        await update.message.reply_text(f"✅ Claude API شغّال!\nالرد: {msg}")
     else:
-        await update.message.reply_text(f"❌ Gemini فاشل!\nالخطأ: {msg}\n\nتحقق من GEMINI_API_KEY في Railway Variables.")
+        await update.message.reply_text(f"❌ Claude API فاشل!\nالخطأ: {msg}\n\nتحقق من ANTHROPIC_API_KEY في Railway Variables.")
 
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -295,12 +295,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(app: Application) -> None:
     await load_products_cache()
-    # تحقق من Gemini عند التشغيل
-    ok, msg = ai_handler.test_gemini()
+    ok, msg = ai_handler.test_claude()
     if ok:
-        logger.info(f"✅ Gemini OK: {msg}")
+        logger.info(f"✅ Claude API OK: {msg}")
     else:
-        logger.error(f"❌ Gemini FAILED: {msg}")
+        logger.error(f"❌ Claude API FAILED: {msg}")
 
 
 def main() -> None:
